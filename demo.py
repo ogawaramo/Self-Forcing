@@ -334,20 +334,40 @@ def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=F
 
         # I2V path
         if image_data is not None:
+            print("🖼️ Starting I2V generation")
             emit_progress('Encoding input image...', 10)
-            img_tensor = base64_to_tensor(image_data).to(device=gpu, dtype=torch.float16)
-            init_latent = vae_encoder.encode_to_latent(img_tensor).to(dtype=torch.float16)
+            try:
+                img_tensor = base64_to_tensor(image_data)
+                print(f"Loaded image tensor {img_tensor.shape} {img_tensor.dtype}")
+                img_tensor = img_tensor.to(device=gpu, dtype=torch.float16)
+                init_latent = vae_encoder.encode_to_latent(img_tensor).to(dtype=torch.float16)
+                print(f"Encoded latent {init_latent.shape} {init_latent.dtype}")
 
-            i2v_pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=gpu)
-            i2v_pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=gpu)
-            noise = torch.randn([1, 20, 16, 60, 104], device=gpu, dtype=torch.float16, generator=rnd)
-            generation_start_time = time.time()
-            emit_progress('Generating video...', 20)
-            video = i2v_pipeline.inference(noise=noise, text_prompts=[prompt], initial_latent=init_latent)
-            video = video.to(torch.float16) * 2 - 1
-            total_frames_sent = video.shape[1]
-            for i in range(total_frames_sent):
-                frame_send_queue.put((video[0, i].cpu(), i, 0, job_id))
+                i2v_pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=gpu)
+                i2v_pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=gpu)
+
+                noise = torch.randn([1, 20, 16, 60, 104], device=gpu, dtype=torch.float16, generator=rnd)
+                generation_start_time = time.time()
+                emit_progress('Generating video...', 20)
+                print("⚙️ Running I2V pipeline...")
+                video = i2v_pipeline.inference(noise=noise, text_prompts=[prompt], initial_latent=init_latent)
+                print(f"Pipeline output {video.shape} {video.dtype}")
+                video = video.to(torch.float16) * 2 - 1
+                total_frames_sent = video.shape[1]
+                for i in range(total_frames_sent):
+                    frame_send_queue.put((video[0, i].cpu(), i, 0, job_id))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"❌ I2V generation error: {e}")
+                socketio.emit('error', {
+                    'message': f'I2V generation failed: {str(e)}',
+                    'job_id': job_id
+                })
+                generation_active = False
+                stop_event.set()
+                frame_send_queue.put(None)
+                return
 
             frame_send_queue.join()
             generate_mp4_from_images("./images", "./videos/"+anim_name+".mp4", frame_rate)

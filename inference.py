@@ -123,19 +123,21 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     if args.i2v:
         # For image-to-video, batch contains image and caption
-        prompt = batch['prompts'][0]  # Get caption from batch
+        prompt = batch['prompts'][0]
         prompts = [prompt] * args.num_samples
 
-        # Process the image
+        print("[I2V] Encoding input image...")
         image = batch['image'].squeeze(0).unsqueeze(0).unsqueeze(2).to(device=device, dtype=torch.bfloat16)
+        print(f"[I2V] Image tensor: {image.shape} {image.dtype}")
 
         # Encode the input image as the first latent
         initial_latent = pipeline.vae.encode_to_latent(image).to(device=device, dtype=torch.bfloat16)
+        print(f"[I2V] Encoded latent: {initial_latent.shape} {initial_latent.dtype}")
         initial_latent = initial_latent.repeat(args.num_samples, 1, 1, 1, 1)
 
-        sampled_noise = torch.randn(
-            [args.num_samples, args.num_output_frames - 1, 16, 60, 104], device=device, dtype=torch.bfloat16
-        )
+        sampled_noise = torch.randn([
+            args.num_samples, args.num_output_frames - 1, 16, 60, 104
+        ], device=device, dtype=torch.bfloat16)
     else:
         # For text-to-video, batch is just the text prompt
         prompt = batch['prompts'][0]
@@ -157,6 +159,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
         return_latents=True,
         initial_latent=initial_latent,
     )
+    print(f"[I2V] Inference complete. Video shape: {video.shape}")
     current_video = rearrange(video, 'b t c h w -> b t h w c').cpu()
     all_video.append(current_video)
     num_generated_frames += latents.shape[1]
