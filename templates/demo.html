@@ -220,6 +220,11 @@
                     </div>
 
                     <div class="control-group">
+                        <label for="imageInput">Upload Image (optional for I2V):</label>
+                        <input type="file" id="imageInput" accept="image/*">
+                    </div>
+
+                    <div class="control-group">
                         <div style="display: flex; gap: 15px; align-items: flex-start; flex-wrap: wrap;">
                             <div class="torch-compile-toggle">
                                 <label>
@@ -429,10 +434,21 @@
             }
 
             const seed = parseInt(document.getElementById('seed').value) || 31337;
-            // const totalBlocks = parseInt(document.getElementById('blocks').value) || 7;
             const enableTorchCompile = document.getElementById('torchCompile').checked;
             const enableFp8 = document.getElementById('fp8Toggle').checked;
             const useTaehv = document.getElementById('taehvToggle').checked;
+            const file = document.getElementById('imageInput').files[0];
+
+            const sendRequest = (imgData) => {
+                socket.emit('start_generation', {
+                    prompt: prompt,
+                    seed: seed,
+                    enable_torch_compile: enableTorchCompile,
+                    enable_fp8: enableFp8,
+                    use_taehv: useTaehv,
+                    image_data: imgData
+                });
+            };
 
             // Reset state
             frameBuffer = [];
@@ -444,13 +460,15 @@
             enableControls(false);
             startTime = Date.now();
 
-            socket.emit('start_generation', {
-                prompt: prompt,
-                seed: seed,
-                enable_torch_compile: enableTorchCompile,
-                enable_fp8: enableFp8,
-                use_taehv: useTaehv
-            });
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    sendRequest(e.target.result);
+                };
+                reader.readAsDataURL(file);
+            } else {
+                sendRequest(null);
+            }
         }
 
         function stopGeneration() {

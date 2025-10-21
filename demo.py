@@ -24,7 +24,7 @@ from threading import Thread, Event
 from pipeline import CausalInferencePipeline
 from demo_utils.constant import ZERO_VAE_CACHE
 from demo_utils.vae_block3 import VAEDecoderWrapper
-from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder
+from utils.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from demo_utils.utils import generate_timestamp
 from demo_utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 
@@ -141,6 +141,19 @@ pipeline = CausalInferencePipeline(
     vae=vae_decoder
 )
 
+# Additional pipeline with full VAE for I2V support
+vae_encoder = WanVAEWrapper()
+vae_encoder.eval()
+vae_encoder.to(dtype=torch.float16, device=gpu)
+vae_encoder.requires_grad_(False)
+i2v_pipeline = CausalInferencePipeline(
+    config,
+    device=gpu,
+    generator=transformer,
+    text_encoder=text_encoder,
+    vae=vae_encoder
+)
+
 if low_memory:
     DynamicSwapInstaller.install_model(text_encoder, device=gpu)
 else:
@@ -185,6 +198,20 @@ def tensor_to_base64_frame(frame_tensor):
     image.save("./images/%s/%s_%03d.jpg" % (anim_name, anim_name, frame_number))
     img_str = base64.b64encode(buffer.getvalue()).decode()
     return f"data:image/jpeg;base64,{img_str}"
+
+
+def base64_to_tensor(img_b64):
+    """Convert base64 image data to normalized tensor."""
+    if img_b64 is None:
+        return None
+    if img_b64.startswith('data:'):
+        img_b64 = img_b64.split(',')[1]
+    image = Image.open(BytesIO(base64.b64decode(img_b64))).convert('RGB')
+    image = image.resize((832, 480), Image.LANCZOS)
+    arr = np.array(image).astype(np.float32)
+    tensor = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0).unsqueeze(2)
+    tensor = tensor / 127.5 - 1.0
+    return tensor
 
 
 def frame_sender_worker():
@@ -239,7 +266,7 @@ def frame_sender_worker():
 
 
 @torch.no_grad()
-def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=False, use_taehv=False):
+def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=False, use_taehv=False, image_data=None):
     """Generate video and push frames immediately to frontend."""
     global generation_active, stop_event, frame_send_queue, sender_thread, models_compiled, torch_compile_applied, fp8_applied, current_vae_decoder, current_use_taehv, frame_rate, anim_name
 
@@ -304,6 +331,58 @@ def generate_video_stream(prompt, seed, enable_torch_compile=False, enable_fp8=F
         emit_progress('Initializing generation...', 12)
 
         rnd = torch.Generator(gpu).manual_seed(seed)
+
+        # I2V path
+        if image_data is not None:
+            print("🖼️ Starting I2V generation")
+            emit_progress('Encoding input image...', 10)
+            try:
+                img_tensor = base64_to_tensor(image_data)
+                print(f"Loaded image tensor {img_tensor.shape} {img_tensor.dtype}")
+                img_tensor = img_tensor.to(device=gpu, dtype=torch.float16)
+                init_latent = vae_encoder.encode_to_latent(img_tensor).to(dtype=torch.float16)
+                print(f"Encoded latent {init_latent.shape} {init_latent.dtype}")
+
+                i2v_pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=gpu)
+                i2v_pipeline._initialize_crossattn_cache(batch_size=1, dtype=torch.float16, device=gpu)
+
+                noise = torch.randn([1, 20, 16, 60, 104], device=gpu, dtype=torch.float16, generator=rnd)
+                generation_start_time = time.time()
+                emit_progress('Generating video...', 20)
+                print("⚙️ Running I2V pipeline...")
+                video = i2v_pipeline.inference(noise=noise, text_prompts=[prompt], initial_latent=init_latent)
+                print(f"Pipeline output {video.shape} {video.dtype}")
+                video = video.to(torch.float16) * 2 - 1
+                total_frames_sent = video.shape[1]
+                for i in range(total_frames_sent):
+                    frame_send_queue.put((video[0, i].cpu(), i, 0, job_id))
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                print(f"❌ I2V generation error: {e}")
+                socketio.emit('error', {
+                    'message': f'I2V generation failed: {str(e)}',
+                    'job_id': job_id
+                })
+                generation_active = False
+                stop_event.set()
+                frame_send_queue.put(None)
+                return
+
+            frame_send_queue.join()
+            generate_mp4_from_images("./images", "./videos/"+anim_name+".mp4", frame_rate)
+            emit_progress('Generation complete!', 100)
+            socketio.emit('generation_complete', {
+                'message': 'Video generation completed!',
+                'total_frames': total_frames_sent,
+                'generation_time': f"{time.time()-generation_start_time:.2f}s",
+                'job_id': job_id
+            })
+            generation_active = False
+            stop_event.set()
+            frame_send_queue.put(None)
+            return
+
         # all_latents = torch.zeros([1, 21, 16, 60, 104], device=gpu, dtype=torch.bfloat16)
 
         pipeline._initialize_kv_cache(batch_size=1, dtype=torch.float16, device=gpu)
@@ -582,6 +661,7 @@ def handle_start_generation(data):
     enable_fp8 = data.get('enable_fp8', False)
     use_taehv = data.get('use_taehv', False)
     frame_rate = data.get('fps', 6)
+    image_data = data.get('image_data', None)
 
     if not prompt:
         emit('error', {'message': 'Prompt is required'})
@@ -589,7 +669,8 @@ def handle_start_generation(data):
 
     # Start generation in background thread
     socketio.start_background_task(generate_video_stream, prompt, seed,
-                                   enable_torch_compile, enable_fp8, use_taehv)
+                                   enable_torch_compile, enable_fp8, use_taehv,
+                                   image_data)
     emit('status', {'message': 'Generation started - frames will be sent immediately'})
 
 
